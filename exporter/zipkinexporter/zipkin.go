@@ -124,6 +124,13 @@ func (ze *zipkinExporter) PushTraceData(ctx context.Context, td consumerdata.Tra
 		if err != nil {
 			return len(td.Spans), consumererror.Permanent(err)
 		}
+
+		if (span.StartTime == nil || span.StartTime.Seconds == 0) && sd.StartTime != (time.Time{}) {
+			// work around serialization bug where span has an empty stuct instead of nil in StartTime
+			sd.StartTime = time.Time{}
+			sd.EndTime = time.Time{}
+		}
+
 		zs := ze.zipkinSpan(td.Node, sd)
 		tbatch = append(tbatch, &zs)
 	}
