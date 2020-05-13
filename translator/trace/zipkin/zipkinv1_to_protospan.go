@@ -340,6 +340,12 @@ func parseZipkinV1Annotations(annotations []*annotation) *annotationParseResult 
 			res.LateAnnotationTime = ts
 		}
 
+		if annotationHasSpanKind {
+			// Work around for https://github.com/open-telemetry/opentelemetry-collector/issues/960
+			// If this annotation is for the send/receive timestamps, we don't really need to add a time event also
+			continue
+		}
+
 		timeEvent := &tracepb.Span_TimeEvent{
 			Time: ts,
 			// More economically we could use a tracepb.Span_TimeEvent_Message, however, it will mean the loss of some information.
