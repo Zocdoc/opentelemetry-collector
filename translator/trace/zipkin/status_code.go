@@ -28,7 +28,7 @@ type status struct {
 }
 
 // statusMapper contains codes translated from different sources to OC status codes
-type statusMapper struct {
+type StatusMapper struct {
 	// oc status code extracted from "status.code" tags
 	fromStatus status
 	// oc status code extracted from "census.status_code" tags
@@ -42,7 +42,7 @@ type statusMapper struct {
 // then fallback on code extracted from "status.code" tags
 // and finally fallback on code extracted and translated from "http.status_code"
 // ocStatus must be called after all tags/attributes are processed with the `fromAttribute` method.
-func (m *statusMapper) ocStatus() *tracepb.Status {
+func (m *StatusMapper) OcStatus() *tracepb.Status {
 	var s status
 	switch {
 	case m.fromCensus.codePtr != nil:
@@ -66,7 +66,7 @@ func (m *statusMapper) ocStatus() *tracepb.Status {
 	return nil
 }
 
-func (m *statusMapper) fromAttribute(key string, attrib *tracepb.AttributeValue) bool {
+func (m *StatusMapper) FromAttribute(key string, attrib *tracepb.AttributeValue) bool {
 	switch key {
 	case tracetranslator.TagZipkinCensusCode:
 		m.fromCensus.codePtr = attribToStatusCode(attrib)

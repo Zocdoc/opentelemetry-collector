@@ -147,7 +147,7 @@ func zipkinV1ThriftBinAnnotationsToOCAttributes(ztBinAnnotations []*zipkincore.B
 		return nil, nil, ""
 	}
 
-	sMapper := &statusMapper{}
+	sMapper := &StatusMapper{}
 	var localComponent string
 	attributeMap := make(map[string]*tracepb.AttributeValue)
 	for _, binaryAnnotation := range ztBinAnnotations {
@@ -203,14 +203,14 @@ func zipkinV1ThriftBinAnnotationsToOCAttributes(ztBinAnnotations []*zipkincore.B
 			localComponent = string(binaryAnnotation.Value)
 		}
 
-		if drop := sMapper.fromAttribute(key, pbAttrib); drop {
+		if drop := sMapper.FromAttribute(key, pbAttrib); drop {
 			continue
 		}
 
 		attributeMap[key] = pbAttrib
 	}
 
-	status = sMapper.ocStatus()
+	status = sMapper.OcStatus()
 
 	if len(attributeMap) == 0 {
 		return nil, status, ""
