@@ -18,9 +18,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"math/rand"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/collector/exporter/exportertest"
+
+	"go.opentelemetry.io/collector/internal/data/testdata"
+	tracetranslator "go.opentelemetry.io/collector/translator/trace"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -30,6 +38,8 @@ import (
 	"go.opentelemetry.io/collector/consumer/pdata"
 	otlpcommon "go.opentelemetry.io/collector/internal/data/opentelemetry-proto-gen/common/v1"
 	v1 "go.opentelemetry.io/collector/internal/data/opentelemetry-proto-gen/trace/v1"
+
+	_ "net/http/pprof"
 )
 
 var (
@@ -743,6 +753,151 @@ func BenchmarkConsumeTracesCompleteOnFirstBatch(b *testing.B) {
 		}}
 		p.ConsumeTraces(context.Background(), pdata.TracesFromOtlp(trace))
 	}
+}
+
+type concurrencyTest struct {
+	name           string
+	numTraces      int
+	spansPerTrace  int
+	ringBufferSize int
+	waitDuration   time.Duration
+}
+
+func TestHighConcurrency(t *testing.T) {
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+
+	tests := []concurrencyTest{
+		{
+			name:           "exceed_ring_buffer_size",
+			numTraces:      400,
+			spansPerTrace:  100,
+			ringBufferSize: 100,
+			waitDuration:   100 * time.Millisecond,
+		},
+		{
+			name:           "fast_wait_duration",
+			numTraces:      400,
+			spansPerTrace:  100,
+			ringBufferSize: 10000,
+			waitDuration:   1 * time.Millisecond,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+
+			traceIds, batches := generateTraces(test.numTraces, test.spansPerTrace)
+			// Shuffle the batches so that the spans for each trace will arrive in a random order
+			rand.Shuffle(len(batches), func(i, j int) { batches[i], batches[j] = batches[j], batches[i] })
+
+			expectedSpanCount := 0
+			for _, b := range batches {
+				expectedSpanCount += b.SpanCount()
+			}
+			require.EqualValues(t, test.numTraces*test.spansPerTrace, expectedSpanCount)
+
+			st := newMemoryStorage()
+			next := &exportertest.SinkTraceExporter{}
+
+			config := Config{
+				WaitDuration: test.waitDuration,
+				NumTraces:    test.ringBufferSize,
+			}
+
+			logger := zap.NewNop()
+			// For local debugging
+			//conf := zap.NewDevelopmentConfig()
+			//// Debug to help follow the operations on the trace
+			//conf.Level.SetLevel(zapcore.DebugLevel)
+			//logger, err := conf.Build()
+			//require.NoError(t, err)
+
+			p, err := newGroupByTraceProcessor(logger, st, next, config)
+			require.NoError(t, err)
+
+			ctx := context.Background()
+			p.Start(ctx, nil)
+
+			wg := sync.WaitGroup{}
+			wg.Add(len(batches))
+
+			for _, b := range batches {
+				go func(batch pdata.Traces) {
+					_ = p.ConsumeTraces(context.Background(), batch)
+					wg.Done()
+				}(b)
+			}
+
+			// Wait until all calls to ConsumeTraces have completed
+			wg.Wait()
+
+			// All events have been emitted, this will wait until they are all consumed
+			p.Shutdown(ctx)
+
+			// Because the call to nextConsumer happens in a goroutine there is a race here
+			// This will only wait 10s if the test is going to fail, otherwise it should be ~2s
+			deadline := time.Now().Add(10 * time.Second)
+			for true {
+				if expectedSpanCount == next.SpansCount() {
+					break
+				}
+				if time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(1 * time.Second)
+			}
+
+			receivedTraceBatches := next.AllTraces()
+			// ideally this would equal len(traceIds) but its not always the case b/c of timing races of the enqueue/dequeue
+			uniqTraceIdsToSpanCount := map[string]int{}
+			for _, batch := range receivedTraceBatches {
+				rs := batch.ResourceSpans()
+				for i := 0; i < rs.Len(); i++ {
+					ils := rs.At(i).InstrumentationLibrarySpans()
+					for k := 0; k < ils.Len(); k++ {
+						spans := ils.At(k).Spans()
+						for s := 0; s < ils.Len(); s++ {
+							traceId := spans.At(s).TraceID().HexString()
+							if _, ok := uniqTraceIdsToSpanCount[traceId]; !ok {
+								uniqTraceIdsToSpanCount[traceId] = 0
+							}
+							uniqTraceIdsToSpanCount[traceId] = uniqTraceIdsToSpanCount[traceId] + 1
+						}
+					}
+				}
+			}
+
+			assert.EqualValues(t, len(traceIds), len(uniqTraceIdsToSpanCount))
+
+			// Under the current buffer eviction code path it intentionally discards spans, but that seems wrong
+			// There is a separate bug in the release phase where the operation isn't atomic and spans can be release multiple times
+			for k, v := range uniqTraceIdsToSpanCount {
+				assert.EqualValues(t, 100, v, "Trace %s should have 100 spans", k)
+			}
+
+			assert.EqualValues(t, expectedSpanCount, next.SpansCount())
+		})
+	}
+}
+
+func generateTraces(numTraces int, numSpans int) ([][]byte, []pdata.Traces) {
+	traceIds := make([][]byte, numTraces)
+	var tds []pdata.Traces
+	for i := 0; i < numTraces; i++ {
+		traceIds[i] = tracetranslator.UInt64ToByteTraceID(1, uint64(i+1))
+		// Send each span in a separate batch
+		for j := 0; j < numSpans; j++ {
+			td := testdata.GenerateTraceDataOneSpan()
+			span := td.ResourceSpans().At(0).InstrumentationLibrarySpans().At(0).Spans().At(0)
+			span.SetTraceID(pdata.NewTraceID(traceIds[i]))
+			span.SetSpanID(tracetranslator.UInt64ToByteSpanID(uint64(i<<5) + uint64(j+1)))
+			tds = append(tds, td)
+		}
+	}
+
+	return traceIds, tds
 }
 
 type mockProcessor struct {
